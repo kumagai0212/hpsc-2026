@@ -41,7 +41,7 @@ int main (int argc, char** argv) {
   H5Pclose(plist);
   double time = chrono::duration<double>(toc - tic).count();
   int sum = 0;
-  for (int i=0; i<Nlocal[0]*Nlocal[1]; i++)
+  for (int i=0; i<count[0]*count[1]; i++)
     sum += buffer[i];
   printf("sum=%d\n",sum);
   printf("N=%d: %lf s (%lf GB/s)\n",NX*NY,time,4*NX*NY/time/1e9);
