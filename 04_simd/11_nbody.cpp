@@ -5,7 +5,7 @@
 
 int main() {
   const int N = 16;
-  float x[N], y[N], m[N], fx[N], fy[N];
+  alignas(64) float x[N], y[N], m[N], fx[N], fy[N];
   for(int i=0; i<N; i++) {
     x[i] = drand48();
     y[i] = drand48();
@@ -13,7 +13,7 @@ int main() {
     fx[i] = fy[i] = 0;
   }
 
-  float indices[N];
+  alignas(64) float indices[N];
   for (int j = 0; j < N; j++) {
     indices[j] = (float)j; // 0.0, 1.0, 2.0, ... 15.0 という連番を作る
   }
