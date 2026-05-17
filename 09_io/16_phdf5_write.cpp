@@ -14,7 +14,6 @@ int main (int argc, char** argv) {
   MPI_Comm_rank(MPI_COMM_WORLD, &mpirank);
   assert(mpisize == dim[0]*dim[1]);
   hsize_t N[2] = {NX, NY};
-  hsize_t Nlocal[2] = {(NX + dim[0] - 1) / dim[0], (NY + dim[1] - 1) / dim[1]};
   hsize_t offset[2] = {mpirank / dim[0], mpirank % dim[1]};
   hsize_t count[2] = {NX / dim[0], NY / dim[1]};
   hsize_t stride[2] = {dim[0], dim[1]};

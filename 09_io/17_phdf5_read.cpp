@@ -21,7 +21,6 @@ int main (int argc, char** argv) {
   hsize_t N[ndim];
   H5Sget_simple_extent_dims(globalspace, N, NULL);
   hsize_t NX = N[0], NY = N[1];
-  hsize_t Nlocal[2] = {(NX + dim[0] - 1) / dim[0], (NY + dim[1] - 1) / dim[1]};
   hsize_t offset[2] = {mpirank / dim[0], mpirank % dim[1]};
   hsize_t count[2] = {NX / dim[0], NY / dim[1]};
   hsize_t stride[2] = {dim[0], dim[1]};
