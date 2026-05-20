@@ -35,9 +35,17 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
       block_a[j][i] = d_a[(k + j) * dim_m + offset_a_m + i];
-      // 変更点: Bを事前にK×N row-majorに転置しておくことで、同一warp内スレッドが
-      // 隣接アドレスを読む（coalesced access）。転置前は stride=dim_k の非連続アクセスだった。
-      block_b[j][i] = d_b[(k + j) * dim_n + offset_b_n + i];
+    }
+    // 変更点: Bは half2 で2要素まとめて読み、グローバルメモリアクセス命令数を削減する。
+    // 1スレッドが 8 個の half2 を担当し、64スレッド全体で 16x64 タイルを埋める。
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+      int load_id = threadIdx.x + t * 64;
+      int j = load_id >> 5;
+      int col2 = (load_id & 31) << 1;
+      half2 value = reinterpret_cast<const half2*>(&d_b[(k + j) * dim_n + offset_b_n])[col2 >> 1];
+      block_b[j][col2] = __low2half(value);
+      block_b[j][col2 + 1] = __high2half(value);
     }
     __syncthreads();
     // 変更点: Bフラグメントはrに依存しないため、先に4個まとめてロードして再利用
