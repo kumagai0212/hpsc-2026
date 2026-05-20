@@ -3,16 +3,13 @@
 #include <random>
 #include <stdint.h>
 #include <cublas_v2.h>
-#include <cuda_fp16.h>
 #include <mma.h>
 #include <chrono>
 using namespace std;
 using namespace nvcuda;
 
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
-           const half *__restrict__ d_a,
-           const half *__restrict__ d_b,
-           float *__restrict__ d_c) {
+		       float *d_a, float *d_b, float *d_c) {
   int offset_a_m = 64 * blockIdx.x;
   int offset_b_n = 64 * blockIdx.y;
   int i = threadIdx.x;
@@ -31,24 +28,19 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   
   for (int k = 0; k < dim_k; k += 16) {
     __syncthreads();
-    // 変更点: 入力行列を事前にhalf化しておき、カーネル内のfloat->half変換を削減
-#pragma unroll
     for (int j = 0; j < 16; ++j) {
-      block_a[j][i] = d_a[(k + j) * dim_m + offset_a_m + i];
-      block_b[j][i] = d_b[(offset_b_n + i) * dim_k + k + j];
+      block_a[j][i] = __float2half(d_a[(k + j) * dim_m + offset_a_m + i]);
+      block_b[j][i] = __float2half(d_b[(offset_b_n + i) * dim_k + k + j]);
     }
     __syncthreads();
-    // 変更点: Bフラグメントはrに依存しないため、先に4個まとめてロードして再利用
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag[4];
-    for (int c = 0; c < 4; c++) {
-      wmma::load_matrix_sync(b_frag[c], &block_b[0][c * 16], 64);
-    }
     for (int r = 0; r < 2; r++) {
       int row_tile = warp_id * 2 + r;
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
       wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], 64);
       for (int c = 0; c < 4; c++) {
-        wmma::mma_sync(acc[r][c], a_frag, b_frag[c], acc[r][c]);
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+        wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], 64);
+        wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
       }
     }
   }
@@ -70,26 +62,16 @@ int main(int argc, const char **argv) {
   float beta = 0.0;
   int Nt = 10;
   float *A, *B, *C, *C2;
-  half *A16, *B16;
   cudaMallocManaged(&A, m * k * sizeof(float));
   cudaMallocManaged(&B, k * n * sizeof(float));
   cudaMallocManaged(&C, m * n * sizeof(float));
   cudaMallocManaged(&C2, m * n * sizeof(float));
-  cudaMallocManaged(&A16, m * k * sizeof(half));
-  cudaMallocManaged(&B16, k * n * sizeof(half));
   for (int i=0; i<m; i++)
     for (int j=0; j<k; j++)
       A[k*i+j] = drand48();
   for (int i=0; i<k; i++)
     for (int j=0; j<n; j++)
       B[n*i+j] = drand48();
-  // 変更点: half入力を一度だけ作成し、計測中の型変換コストを排除
-  for (int i=0; i<m; i++)
-    for (int j=0; j<k; j++)
-      A16[k*i+j] = __float2half(A[k*i+j]);
-  for (int i=0; i<k; i++)
-    for (int j=0; j<n; j++)
-      B16[n*i+j] = __float2half(B[n*i+j]);
   for (int i=0; i<n; i++)
     for (int j=0; j<m; j++)
       C[m*i+j] = C2[m*i+j] = 0;
@@ -125,8 +107,8 @@ int main(int argc, const char **argv) {
     kernel<<< grid, block >>>(m,
 			      n,
 			      k,
-            A16,
-            B16,
+			      A,
+			      B,
 			      C2);
     cudaDeviceSynchronize();
   }
@@ -143,8 +125,6 @@ int main(int argc, const char **argv) {
   printf("error: %lf\n", err/n/m);
   cudaFree(A);
   cudaFree(B);
-  cudaFree(A16);
-  cudaFree(B16);
   cudaFree(C);
   cudaFree(C2);
   cublasDestroy(cublas_handle);
