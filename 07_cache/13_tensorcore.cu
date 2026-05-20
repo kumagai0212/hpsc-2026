@@ -122,30 +122,44 @@ int main(int argc, const char **argv) {
   cudaMallocManaged(&C2, m * n * sizeof(float));
   cudaMallocManaged(&A16, m * k * sizeof(half));
   cudaMallocManaged(&B16_T, k * n * sizeof(half));
+  auto init_tic = chrono::steady_clock::now();
   for (int i=0; i<m; i++)
     for (int j=0; j<k; j++)
       A[k*i+j] = drand48();
   for (int i=0; i<k; i++)
     for (int j=0; j<n; j++)
       B[n*i+j] = drand48();
+  auto init_toc = chrono::steady_clock::now();
+
+  auto convert_a_tic = chrono::steady_clock::now();
   // 変更点: half入力を一度だけ作成し、計測中の型変換コストを排除
   for (int i=0; i<m; i++)
     for (int j=0; j<k; j++)
       A16[k*i+j] = __float2half(A[k*i+j]);
+  auto convert_a_toc = chrono::steady_clock::now();
+
+  auto convert_b_tic = chrono::steady_clock::now();
   // 変更点: Bをまとめてfloat->half変換しつつK×N row-majorに転置。
   // 元のBはcuBLASの列優先レイアウトでB[n][k]=B_ptr[n*k+k_idx]だったが、
   // 転置後はB16_T[k][n]=B16_T[ki*n+ni]とし、カーネル内でcoalescedに読める。
   for (int ki=0; ki<k; ki++)
     for (int ni=0; ni<n; ni++)
       B16_T[ki*n + ni] = __float2half(B[ni*k + ki]);
+  auto convert_b_toc = chrono::steady_clock::now();
   for (int i=0; i<n; i++)
     for (int j=0; j<m; j++)
       C[m*i+j] = C2[m*i+j] = 0;
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
-  auto tic = chrono::steady_clock::now();
+  cudaEvent_t start_event, stop_event;
+  cudaEventCreate(&start_event);
+  cudaEventCreate(&stop_event);
+  float cublas_ms = 0.0f;
+  cudaEventRecord(start_event);
   for (int i = 0; i < Nt+2; i++) {
-    if (i == 2) tic = chrono::steady_clock::now();
+    if (i == 2) {
+      cudaEventRecord(start_event);
+    }
     cublasGemmEx(cublas_handle,
 		 CUBLAS_OP_N,
 		 CUBLAS_OP_N,
@@ -161,15 +175,21 @@ int main(int argc, const char **argv) {
 		 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     cudaDeviceSynchronize();
   }
-  auto toc = chrono::steady_clock::now();
   int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
-  double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
+  cudaEventRecord(stop_event);
+  cudaEventSynchronize(stop_event);
+  cudaEventElapsedTime(&cublas_ms, start_event, stop_event);
+  double tcublas = double(cublas_ms) / 1.0e3 / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
   int tile = 64;
   dim3 block = dim3(tile);
   dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
+  float kernel_ms = 0.0f;
+  cudaEventRecord(start_event);
   for (int i = 0; i < Nt+2; i++) {
-    if (i == 2) tic = chrono::steady_clock::now();
+    if (i == 2) {
+      cudaEventRecord(start_event);
+    }
     kernel<<< grid, block >>>(m,
 			      n,
 			      k,
@@ -178,9 +198,19 @@ int main(int argc, const char **argv) {
 			      C2);
     cudaDeviceSynchronize();
   }
-  toc = chrono::steady_clock::now();
-  double tcutlass = chrono::duration<double>(toc - tic).count() / Nt;
+  cudaEventRecord(stop_event);
+  cudaEventSynchronize(stop_event);
+  cudaEventElapsedTime(&kernel_ms, start_event, stop_event);
+  double tcutlass = double(kernel_ms) / 1.0e3 / Nt;
   double cutlass_flops = double(num_flops) / tcutlass / 1.0e9;
+  double init_seconds = chrono::duration<double>(init_toc - init_tic).count();
+  double convert_a_seconds = chrono::duration<double>(convert_a_toc - convert_a_tic).count();
+  double convert_b_seconds = chrono::duration<double>(convert_b_toc - convert_b_tic).count();
+  printf("Init A/B: %.6f s\n", init_seconds);
+  printf("Convert A -> half: %.6f s\n", convert_a_seconds);
+  printf("Transpose + convert B -> half: %.6f s\n", convert_b_seconds);
+  printf("cuBLAS avg: %.6f s\n", tcublas);
+  printf("Kernel avg: %.6f s\n", tcutlass);
   printf("CUBLAS: %.2f Gflops, CUTLASS: %.2f Gflops\n", cublas_flops, cutlass_flops);
   double err = 0;
   for (int i=0; i<n; i++) {
@@ -195,5 +225,7 @@ int main(int argc, const char **argv) {
   cudaFree(B16_T);
   cudaFree(C);
   cudaFree(C2);
+  cudaEventDestroy(start_event);
+  cudaEventDestroy(stop_event);
   cublasDestroy(cublas_handle);
 }
