@@ -53,8 +53,8 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   int offset_b_n = 64 * blockIdx.y;
   int warp_id = threadIdx.x / 32;
 
-  __shared__ __align__(16) half block_a[2][16][64];
-  __shared__ __align__(16) half block_b[2][16][64];
+  __shared__ __align__(16) half block_a[3][16][64];
+  __shared__ __align__(16) half block_b[3][16][64];
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4]; //16*16*16の箱のイメージ
 
@@ -65,16 +65,25 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
 
   int num_tiles = dim_k / 16;
 
+  // 変更点: 最初に3タイル分を先読みし、以後は3タイル先を仕込むことで
+  // 今の計算より十分前に共有メモリへ載せる。
   stage_load_cp_async(threadIdx.x, 0, 0, dim_m, dim_n, offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
+  if (num_tiles > 1) {
+    stage_load_cp_async(threadIdx.x, 16, 1, dim_m, dim_n, offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
+  }
+  if (num_tiles > 2) {
+    stage_load_cp_async(threadIdx.x, 32, 2, dim_m, dim_n, offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
+  }
   cp_async_wait_group_0();
   __syncthreads();
 
   for (int tile = 0; tile < num_tiles; ++tile) {
-    int cur = tile & 1;
-    int nxt = cur ^ 1;
+    int cur = tile % 3;
+    int nxt = (tile + 3) % 3;
 
-    if (tile + 1 < num_tiles) {
-      stage_load_cp_async(threadIdx.x, (tile + 1) * 16, nxt, dim_m, dim_n, offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
+    if (tile + 3 < num_tiles) {
+      // 変更点: 3タイル先を仕込むことで、cp.async の待ちを今の計算でより長く隠す
+      stage_load_cp_async(threadIdx.x, (tile + 3) * 16, nxt, dim_m, dim_n, offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
     }
 
     // 変更点: Bフラグメントはrに依存しないため、先に4個まとめてロードして再利用
