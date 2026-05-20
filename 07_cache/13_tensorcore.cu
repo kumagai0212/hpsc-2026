@@ -9,6 +9,42 @@
 using namespace std;
 using namespace nvcuda;
 
+__device__ __forceinline__ void cp_async_16(void *dst, const void *src) {
+  unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(smem_addr), "l"(src));
+}
+
+__device__ __forceinline__ void cp_async_commit_group() {
+  asm volatile("cp.async.commit_group;");
+}
+
+__device__ __forceinline__ void cp_async_wait_group_0() {
+  asm volatile("cp.async.wait_group 0;");
+}
+
+__device__ __forceinline__ void stage_load_cp_async(
+    int thread_id,
+    int tile_k,
+    int stage,
+    int dim_m,
+    int dim_n,
+    int offset_a_m,
+    int offset_b_n,
+    const half *__restrict__ d_a,
+    const half *__restrict__ d_b,
+    half block_a[][16][64],
+    half block_b[][16][64]) {
+  // 変更点: 1回のtile読み込みを64スレッドで分担し、A/Bのcp.asyncを同時に発行する
+#pragma unroll
+  for (int chunk = thread_id; chunk < 128; chunk += 64) {
+    int row = chunk >> 3;
+    int col = (chunk & 7) << 3;
+    cp_async_16(&block_a[stage][row][col], &d_a[(tile_k + row) * dim_m + offset_a_m + col]);
+    cp_async_16(&block_b[stage][row][col], &d_b[(tile_k + row) * dim_n + offset_b_n + col]);
+  }
+  cp_async_commit_group();
+}
+
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
            const half *__restrict__ d_a,
            const half *__restrict__ d_b,
@@ -18,8 +54,8 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   int i = threadIdx.x;
   int warp_id = threadIdx.x / 32;
 
-  __shared__ half block_a[16][64];
-  __shared__ half block_b[16][64];
+  __shared__ __align__(16) half block_a[2][16][64];
+  __shared__ __align__(16) half block_b[2][16][64];
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4]; //16*16*16の箱のイメージ
 
@@ -28,32 +64,40 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     for (int c = 0; c < 4; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
-  
-  for (int k = 0; k < dim_k; k += 16) {
-    __syncthreads();
-    // 変更点: 入力行列を事前にhalf化しておき、カーネル内のfloat->half変換を削減
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-      block_a[j][i] = d_a[(k + j) * dim_m + offset_a_m + i];
-      // 変更点: Bを事前にK×N row-majorに転置しておくことで、同一warp内スレッドが
-      // 隣接アドレスを読む（coalesced access）。転置前は stride=dim_k の非連続アクセスだった。
-      block_b[j][i] = d_b[(k + j) * dim_n + offset_b_n + i];
+  int num_tiles = dim_k / 16;
+
+  stage_load_cp_async(threadIdx.x, 0, 0, dim_m, dim_n, offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
+  cp_async_wait_group_0();
+  __syncthreads();
+
+  for (int tile = 0; tile < num_tiles; ++tile) {
+    int cur = tile & 1;
+    int nxt = cur ^ 1;
+
+    if (tile + 1 < num_tiles) {
+      stage_load_cp_async(threadIdx.x, (tile + 1) * 16, nxt, dim_m, dim_n, offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
     }
-    __syncthreads();
+
     // 変更点: Bフラグメントはrに依存しないため、先に4個まとめてロードして再利用
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag[4];
     for (int c = 0; c < 4; c++) {
-      wmma::load_matrix_sync(b_frag[c], &block_b[0][c * 16], 64);
+      wmma::load_matrix_sync(b_frag[c], &block_b[cur][0][c * 16], 64);
     }
     for (int r = 0; r < 2; r++) {
       int row_tile = warp_id * 2 + r;
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-      wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], 64);
+      wmma::load_matrix_sync(a_frag, &block_a[cur][0][row_tile * 16], 64);
       for (int c = 0; c < 4; c++) {
         wmma::mma_sync(acc[r][c], a_frag, b_frag[c], acc[r][c]);
       }
     }
+
+    if (tile + 1 < num_tiles) {
+      cp_async_wait_group_0();
+      __syncthreads();
+    }
   }
+
   for (int r = 0; r < 2; r++) {
     for (int c = 0; c < 4; c++) {
       int c_m = offset_a_m + (warp_id * 2 + r) * 16;
