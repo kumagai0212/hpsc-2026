@@ -25,6 +25,6 @@
 12_vector_4x2: 12_vector_4x2.cu
 	nvcc 12_vector_4x2.cu -Xcompiler "-O3 -fopenmp" -lcublas
 13_tensorcore: 13_tensorcore.cu
-	nvcc 13_tensorcore.cu -Xcompiler "-O3 -fopenmp" -lcublas
+	nvcc 13_tensorcore.cu -arch=sm_90a -Xcompiler "-O3 -fopenmp" -lcublas
 13_tensorcore_orig: 13_tensorcore_orig.cu
-	nvcc 13_tensorcore_orig.cu -Xcompiler "-O3 -fopenmp" -lcublas
+	nvcc 13_tensorcore_orig.cu -arch=sm_90a -Xcompiler "-O3 -fopenmp" -lcublas

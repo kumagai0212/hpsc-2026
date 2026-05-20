@@ -51,7 +51,6 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
            float *__restrict__ d_c) {
   int offset_a_m = 64 * blockIdx.x;
   int offset_b_n = 64 * blockIdx.y;
-  int i = threadIdx.x;
   int warp_id = threadIdx.x / 32;
 
   __shared__ __align__(16) half block_a[2][16][64];
