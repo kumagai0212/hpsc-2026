@@ -35,7 +35,9 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
       block_a[j][i] = d_a[(k + j) * dim_m + offset_a_m + i];
-      block_b[j][i] = d_b[(offset_b_n + i) * dim_k + k + j];
+      // 変更点: Bを事前にK×N row-majorに転置しておくことで、同一warp内スレッドが
+      // 隣接アドレスを読む（coalesced access）。転置前は stride=dim_k の非連続アクセスだった。
+      block_b[j][i] = d_b[(k + j) * dim_n + offset_b_n + i];
     }
     __syncthreads();
     // 変更点: Bフラグメントはrに依存しないため、先に4個まとめてロードして再利用
@@ -70,13 +72,13 @@ int main(int argc, const char **argv) {
   float beta = 0.0;
   int Nt = 10;
   float *A, *B, *C, *C2;
-  half *A16, *B16;
+  half *A16, *B16_T;  // B16_T: K×N row-majorに転置したhalf行列
   cudaMallocManaged(&A, m * k * sizeof(float));
   cudaMallocManaged(&B, k * n * sizeof(float));
   cudaMallocManaged(&C, m * n * sizeof(float));
   cudaMallocManaged(&C2, m * n * sizeof(float));
   cudaMallocManaged(&A16, m * k * sizeof(half));
-  cudaMallocManaged(&B16, k * n * sizeof(half));
+  cudaMallocManaged(&B16_T, k * n * sizeof(half));
   for (int i=0; i<m; i++)
     for (int j=0; j<k; j++)
       A[k*i+j] = drand48();
@@ -87,9 +89,12 @@ int main(int argc, const char **argv) {
   for (int i=0; i<m; i++)
     for (int j=0; j<k; j++)
       A16[k*i+j] = __float2half(A[k*i+j]);
-  for (int i=0; i<k; i++)
-    for (int j=0; j<n; j++)
-      B16[n*i+j] = __float2half(B[n*i+j]);
+  // 変更点: Bをまとめてfloat->half変換しつつK×N row-majorに転置。
+  // 元のBはcuBLASの列優先レイアウトでB[n][k]=B_ptr[n*k+k_idx]だったが、
+  // 転置後はB16_T[k][n]=B16_T[ki*n+ni]とし、カーネル内でcoalescedに読める。
+  for (int ki=0; ki<k; ki++)
+    for (int ni=0; ni<n; ni++)
+      B16_T[ki*n + ni] = __float2half(B[ni*k + ki]);
   for (int i=0; i<n; i++)
     for (int j=0; j<m; j++)
       C[m*i+j] = C2[m*i+j] = 0;
@@ -126,7 +131,7 @@ int main(int argc, const char **argv) {
 			      n,
 			      k,
             A16,
-            B16,
+            B16_T,  // 転置済みK×N half行列を渡す
 			      C2);
     cudaDeviceSynchronize();
   }
@@ -144,7 +149,7 @@ int main(int argc, const char **argv) {
   cudaFree(A);
   cudaFree(B);
   cudaFree(A16);
-  cudaFree(B16);
+  cudaFree(B16_T);
   cudaFree(C);
   cudaFree(C2);
   cublasDestroy(cublas_handle);
