@@ -321,6 +321,9 @@ int main(int argc, const char **argv) {
   cudaEventElapsedTime(&kernel_ms, start_event, stop_event);
   double tcutlass = double(kernel_ms) / 1.0e3 / Nt;
   double cutlass_flops = double(num_flops) / tcutlass / 1.0e9;
+#if 0
+  // ---- 追加した計測/診断出力 (オリジナルの 13_tensorcore_orig.cu には無い) ----
+  // 復活させたい場合は #if 1 にする。
   double init_seconds = chrono::duration<double>(init_toc - init_tic).count();
   double convert_a_seconds = chrono::duration<double>(convert_a_toc - convert_a_tic).count();
   double convert_b_seconds = chrono::duration<double>(convert_b_toc - convert_b_tic).count();
@@ -329,7 +332,11 @@ int main(int argc, const char **argv) {
   printf("Transpose + convert B -> half: %.6f s\n", convert_b_seconds);
   printf("cuBLAS avg: %.6f s\n", tcublas);
   printf("Kernel avg: %.6f s\n", tcutlass);
+#endif
+  // オリジナル相当の出力のみ残す
   printf("CUBLAS: %.2f Gflops, CUTLASS: %.2f Gflops\n", cublas_flops, cutlass_flops);
+
+#if 0
   printf("CUTLASS / CUBLAS: %.2f %%\n", 100.0 * cutlass_flops / cublas_flops);
 
   // ---- カーネル属性と理論上限の診断 ----
@@ -411,6 +418,7 @@ int main(int argc, const char **argv) {
          total_hbm / 1e9, double(n)/BN, double(m)/BM);
   printf("est measured BW    : %.1f GB/s (%.1f %% of peak)\n",
          measured_bw, 100.0 * measured_bw / peak_bw_gbps);
+#endif
 
   double err = 0;
   for (int i=0; i<n; i++) {
