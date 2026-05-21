@@ -92,8 +92,23 @@ __global__ __launch_bounds__(THREADS, 1) void kernel(
     const half *__restrict__ d_a,
     const half *__restrict__ d_b,
     float *__restrict__ d_c) {
-  int offset_a_m = BM * blockIdx.x;
-  int offset_b_n = BN * blockIdx.y;
+  // ---- block swizzle ----
+  // 通常の (blockIdx.x, blockIdx.y) ラスタは M を一周する間に B が L2 から
+  // 追い出されやすい。 GROUP_M 個ずつ M をまとめて N を進めることで、
+  // 同一 B タイルを連続 GROUP_M ブロックで再利用でき L2 ヒット率が上がる。
+  constexpr int GROUP_M = 8;
+  int num_pid_m = gridDim.x;
+  int num_pid_n = gridDim.y;
+  int pid = blockIdx.x + blockIdx.y * num_pid_m;
+  int num_pid_in_group = GROUP_M * num_pid_n;
+  int group_id = pid / num_pid_in_group;
+  int first_pid_m = group_id * GROUP_M;
+  int group_size_m = min(num_pid_m - first_pid_m, GROUP_M);
+  int pid_m = first_pid_m + (pid % group_size_m);
+  int pid_n = (pid % num_pid_in_group) / group_size_m;
+
+  int offset_a_m = BM * pid_m;
+  int offset_b_n = BN * pid_n;
   int tid = threadIdx.x;
   int warp_id = tid >> 5;
   int warp_row = warp_id / WARPS_N;   // 0..WARPS_M-1
@@ -314,6 +329,51 @@ int main(int argc, const char **argv) {
   printf("cuBLAS avg: %.6f s\n", tcublas);
   printf("Kernel avg: %.6f s\n", tcutlass);
   printf("CUBLAS: %.2f Gflops, CUTLASS: %.2f Gflops\n", cublas_flops, cutlass_flops);
+  printf("CUTLASS / CUBLAS: %.2f %%\n", 100.0 * cutlass_flops / cublas_flops);
+
+  // ---- カーネル属性と理論上限の診断 ----
+  cudaFuncAttributes attr;
+  cudaFuncGetAttributes(&attr, kernel);
+  int dev = 0;
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, dev);
+  int active_blocks = 0;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks, kernel, THREADS, 0);
+  int warps_per_block = THREADS / 32;
+  int max_warps_per_sm = prop.maxThreadsPerMultiProcessor / 32;
+  double achieved_occ = double(active_blocks * warps_per_block) / max_warps_per_sm;
+  printf("--- kernel attributes ---\n");
+  printf("regs/thread        : %d\n", attr.numRegs);
+  printf("static shared/blk  : %zu bytes\n", attr.sharedSizeBytes);
+  printf("max threads/block  : %d\n", attr.maxThreadsPerBlock);
+  printf("threads/block used : %d (warps: %d)\n", THREADS, warps_per_block);
+  printf("active blocks/SM   : %d (limit by occupancy calc)\n", active_blocks);
+  printf("achieved occupancy : %.2f %% (%d warps / %d max)\n",
+         100.0 * achieved_occ, active_blocks * warps_per_block, max_warps_per_sm);
+  printf("SM count           : %d\n", prop.multiProcessorCount);
+  int num_blocks = ((m + BM - 1) / BM) * ((n + BN - 1) / BN);
+  double waves = double(num_blocks) / (prop.multiProcessorCount * active_blocks);
+  printf("num blocks         : %d (%.2f waves on %d SMs)\n",
+         num_blocks, waves, prop.multiProcessorCount);
+
+  // 算術強度とトラフィック
+  double block_flops = 2.0 * BM * BN * k;
+  double block_bytes = double(BM + BN) * k * sizeof(half);
+  printf("--- per-block estimates ---\n");
+  printf("tile               : %d x %d x BK=%d, STAGES=%d\n", BM, BN, BK, STAGES);
+  printf("FLOPs / block      : %.2f M\n", block_flops / 1e6);
+  printf("HBM bytes / block  : %.2f KB\n", block_bytes / 1024.0);
+  printf("Arith intensity    : %.2f FLOPs/byte\n", block_flops / block_bytes);
+
+  // ピーク FP16 テンソルコア性能との比較 (H100 SXM: ~989 TFLOPS dense FP16)
+  // 動作クロック * SM 数 * ピーク TC スループットで概算するが、ここでは典型値を使う。
+  // H100 SXM5 のピーク TF32 with FP16 accum: ~756 TFLOPS dense
+  // 簡易に device prop からは取れないので、参考値として 989 TFLOPS で比較。
+  double peak_fp16_tflops = 989.0;
+  printf("--- vs peak FP16 TC (~%.0f TFLOPS dense, ref) ---\n", peak_fp16_tflops);
+  printf("CUBLAS  achieved   : %.2f %% of peak\n", 100.0 * cublas_flops / 1e3 / peak_fp16_tflops);
+  printf("CUTLASS achieved   : %.2f %% of peak\n", 100.0 * cutlass_flops / 1e3 / peak_fp16_tflops);
+
   double err = 0;
   for (int i=0; i<n; i++) {
     for (int j=0; j<m; j++) {
