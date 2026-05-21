@@ -10,12 +10,12 @@ using namespace std;
 using namespace nvcuda;
 
 // ---------- Tile / warp configuration ----------
-// 1ブロックで 128x128 の C を担当 (M x N)。 BK=32 で 2 段の inner-k を行う。
+// 1ブロックで 128x128 の C を担当 (M x N)。 BK=64 で 4 段の inner-k を行う。
 // ブロックは 8 warps = 256 threads。 warp grid は 2 (M) x 4 (N)。
 // 各 warp は 64x32 の C を担当 = 4x2 個の 16x16 WMMA フラグメント。
 constexpr int BM = 128;
 constexpr int BN = 128;
-constexpr int BK = 32;
+constexpr int BK = 64;
 constexpr int WARPS_M = 2;
 constexpr int WARPS_N = 4;
 constexpr int THREADS = 32 * WARPS_M * WARPS_N;   // 256
@@ -23,11 +23,12 @@ constexpr int WM = BM / WARPS_M;                  // 64
 constexpr int WN = BN / WARPS_N;                  // 32
 constexpr int FM = WM / 16;                       // 4
 constexpr int FN = WN / 16;                       // 2
-constexpr int FK = BK / 16;                       // 2
-// 4 ステージにして DRAM 遅延の隠蔽を厚くする。
-// 1 stage = (BK*BM + BK*BN)*sizeof(half) = (32*128 + 32*128)*2 = 16KB
-// 4 stages * 16KB = 64KB/block。 H100 の per-SM shared (228KB) には 2 ブロック載せても余裕。
-constexpr int STAGES = 4;
+constexpr int FK = BK / 16;                       // 4
+// BK を倍にしたぶん、ステージ数は 3 に減らして共有メモリを節約する。
+// 1 stage = (BK*LDA + BK*LDB)*sizeof(half) = (64*136 + 64*136)*2 ≈ 34KB
+// 3 stages ≈ 102KB / block (H100 の opt-in shared 内)
+// メイン loop 同期回数: K/BK = 64 (従来の半分)、 inner-K オーバーラップ区間: 4
+constexpr int STAGES = 3;
 // shared memory のバンク競合を避けるためのパディング (8 halfs = 16 bytes)
 constexpr int PAD = 8;
 constexpr int LDA = BM + PAD;
