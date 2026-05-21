@@ -369,10 +369,13 @@ int main(int argc, const char **argv) {
   // ピーク FP16 テンソルコア性能との比較
   // H100 SXM5 (full) のピーク dense FP16 (FP32 accum) は約 989 TFLOPS / 132 SM
   // → 1 SM あたり約 7.49 TFLOPS @ ブースト時。
-  // クロックを実測値から取得し、現在の SM 数で動的にピークを計算する。
-  // (注: clockRate は kHz 単位、 ブーストクロックや MIG パーティションにより
-  // 実効ピークが変動する可能性あり)
-  double clock_ghz = prop.clockRate / 1.0e6;       // kHz -> GHz
+  // 新しい CUDA では cudaDeviceProp::clockRate 等が削除されたため、
+  // cudaDeviceGetAttribute() で動的に取得する。
+  int clock_khz = 0, mem_clock_khz = 0, mem_bus_bits = 0;
+  cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, dev);
+  cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, dev);
+  cudaDeviceGetAttribute(&mem_bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev);
+  double clock_ghz = clock_khz / 1.0e6;             // kHz -> GHz
   // H100 SM 1 サイクルあたり tensor core FP16 演算数 (FP32 accum, dense):
   // 1 SM = 4 tensor core * 512 FMA/cycle = 2048 FMA/cycle = 4096 FLOPs/cycle
   double flops_per_sm_per_cycle = 4096.0;
@@ -391,8 +394,8 @@ int main(int argc, const char **argv) {
   printf("--- memory subsystem ---\n");
   printf("L2 cache size      : %d KB\n", prop.l2CacheSize / 1024);
   printf("HBM clock          : %d MHz, bus width: %d bit\n",
-         prop.memoryClockRate / 1000, prop.memoryBusWidth);
-  double peak_bw_gbps = 2.0 * prop.memoryClockRate * 1.0e3 * (prop.memoryBusWidth / 8) / 1.0e9;
+         mem_clock_khz / 1000, mem_bus_bits);
+  double peak_bw_gbps = 2.0 * double(mem_clock_khz) * 1.0e3 * (mem_bus_bits / 8) / 1.0e9;
   printf("est peak HBM BW    : %.1f GB/s\n", peak_bw_gbps);
   // カーネル中の HBM 読み込みバイト概算 (A, B を 1 回ずつ読む想定; L2 で再利用されればこれより少ない)
   double total_a_bytes = double(m) * k * sizeof(half);
