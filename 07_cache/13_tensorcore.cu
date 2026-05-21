@@ -11,19 +11,20 @@ using namespace nvcuda;
 
 // ---------- Tile / warp configuration ----------
 // 1ブロックで 128x256 の C を担当 (M x N)。
-// ブロックは 16 warps = 512 threads。 warp grid は 2 (M) x 8 (N)。
-// 各 warp は 64x32 の C を担当 = 4x2 個の 16x16 WMMA フラグメント。
-// 算術強度向上(64→85 FLOPs/B)とワープ並列度(8→16)で発行ストールを隠す。
+// ブロックは 16 warps = 512 threads。 warp grid は 4 (M) x 4 (N)。
+// 各 warp は 32x64 の C を担当 = 2x4 個の 16x16 WMMA フラグメント。
+// 4x4 warp グリッドは 2x8 より A/B 再利用がより対称で、 b_frag 連続 4 個ロードが
+// 共有 B の N 方向にきれいに並ぶため LDS の局所性が良くなる狙い。
 constexpr int BM = 128;
 constexpr int BN = 256;
 constexpr int BK = 32;
-constexpr int WARPS_M = 2;
-constexpr int WARPS_N = 8;
+constexpr int WARPS_M = 4;
+constexpr int WARPS_N = 4;
 constexpr int THREADS = 32 * WARPS_M * WARPS_N;   // 512
-constexpr int WM = BM / WARPS_M;                  // 64
-constexpr int WN = BN / WARPS_N;                  // 32
-constexpr int FM = WM / 16;                       // 4
-constexpr int FN = WN / 16;                       // 2
+constexpr int WM = BM / WARPS_M;                  // 32
+constexpr int WN = BN / WARPS_N;                  // 64
+constexpr int FM = WM / 16;                       // 2
+constexpr int FN = WN / 16;                       // 4
 constexpr int FK = BK / 16;                       // 2
 // 共有メモリ: stage A = 32*(128+8)*2 = 8704, stage B = 32*(256+8)*2 = 16896
 // 3 stages 合計 ≈ 76800 bytes (≈75KB) で静的 __shared__ の範囲内に収まる。
@@ -365,14 +366,48 @@ int main(int argc, const char **argv) {
   printf("HBM bytes / block  : %.2f KB\n", block_bytes / 1024.0);
   printf("Arith intensity    : %.2f FLOPs/byte\n", block_flops / block_bytes);
 
-  // ピーク FP16 テンソルコア性能との比較 (H100 SXM: ~989 TFLOPS dense FP16)
-  // 動作クロック * SM 数 * ピーク TC スループットで概算するが、ここでは典型値を使う。
-  // H100 SXM5 のピーク TF32 with FP16 accum: ~756 TFLOPS dense
-  // 簡易に device prop からは取れないので、参考値として 989 TFLOPS で比較。
-  double peak_fp16_tflops = 989.0;
-  printf("--- vs peak FP16 TC (~%.0f TFLOPS dense, ref) ---\n", peak_fp16_tflops);
-  printf("CUBLAS  achieved   : %.2f %% of peak\n", 100.0 * cublas_flops / 1e3 / peak_fp16_tflops);
-  printf("CUTLASS achieved   : %.2f %% of peak\n", 100.0 * cutlass_flops / 1e3 / peak_fp16_tflops);
+  // ピーク FP16 テンソルコア性能との比較
+  // H100 SXM5 (full) のピーク dense FP16 (FP32 accum) は約 989 TFLOPS / 132 SM
+  // → 1 SM あたり約 7.49 TFLOPS @ ブースト時。
+  // クロックを実測値から取得し、現在の SM 数で動的にピークを計算する。
+  // (注: clockRate は kHz 単位、 ブーストクロックや MIG パーティションにより
+  // 実効ピークが変動する可能性あり)
+  double clock_ghz = prop.clockRate / 1.0e6;       // kHz -> GHz
+  // H100 SM 1 サイクルあたり tensor core FP16 演算数 (FP32 accum, dense):
+  // 1 SM = 4 tensor core * 512 FMA/cycle = 2048 FMA/cycle = 4096 FLOPs/cycle
+  double flops_per_sm_per_cycle = 4096.0;
+  double peak_tflops_dynamic = prop.multiProcessorCount * flops_per_sm_per_cycle * clock_ghz / 1000.0;
+  printf("--- dynamic peak (boost clock %.2f GHz, %d SMs) ---\n",
+         clock_ghz, prop.multiProcessorCount);
+  printf("est peak FP16 TC   : %.2f TFLOPS\n", peak_tflops_dynamic);
+  printf("CUBLAS  achieved   : %.2f %% of dynamic peak\n",
+         100.0 * cublas_flops / 1e3 / peak_tflops_dynamic);
+  printf("CUTLASS achieved   : %.2f %% of dynamic peak\n",
+         100.0 * cutlass_flops / 1e3 / peak_tflops_dynamic);
+  printf("Gap to cuBLAS      : need %.2fx more (cuBLAS %.0f / ours %.0f Gflops)\n",
+         cublas_flops / cutlass_flops, cublas_flops, cutlass_flops);
+
+  // L2 / HBM 帯域
+  printf("--- memory subsystem ---\n");
+  printf("L2 cache size      : %d KB\n", prop.l2CacheSize / 1024);
+  printf("HBM clock          : %d MHz, bus width: %d bit\n",
+         prop.memoryClockRate / 1000, prop.memoryBusWidth);
+  double peak_bw_gbps = 2.0 * prop.memoryClockRate * 1.0e3 * (prop.memoryBusWidth / 8) / 1.0e9;
+  printf("est peak HBM BW    : %.1f GB/s\n", peak_bw_gbps);
+  // カーネル中の HBM 読み込みバイト概算 (A, B を 1 回ずつ読む想定; L2 で再利用されればこれより少ない)
+  double total_a_bytes = double(m) * k * sizeof(half);
+  double total_b_bytes = double(k) * n * sizeof(half);
+  // 各ブロックは A タイル (BM*K) と B タイル (BN*K) を読む。
+  // num_blocks * (BM + BN) * K * sizeof(half) = 全 A 再読込回数 * BM*K + 全 B 再読込回数 * BN*K
+  // 単純化: A は n/BN 回, B は m/BM 回 再読込される。
+  double total_reads = total_a_bytes * (double(n) / BN) + total_b_bytes * (double(m) / BM);
+  double total_writes = double(m) * n * sizeof(float);
+  double total_hbm = total_reads + total_writes;
+  double measured_bw = total_hbm / tcutlass / 1.0e9;
+  printf("est HBM traffic    : %.2f GB (A x%g + B x%g + C)\n",
+         total_hbm / 1e9, double(n)/BN, double(m)/BM);
+  printf("est measured BW    : %.1f GB/s (%.1f %% of peak)\n",
+         measured_bw, 100.0 * measured_bw / peak_bw_gbps);
 
   double err = 0;
   for (int i=0; i<n; i++) {
