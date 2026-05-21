@@ -9,21 +9,49 @@
 using namespace std;
 using namespace nvcuda;
 
+// ---------- Tile / warp configuration ----------
+// 1ブロックで 128x128 の C を担当 (M x N)。 BK=32 で 2 段の inner-k を行う。
+// ブロックは 8 warps = 256 threads。 warp grid は 2 (M) x 4 (N)。
+// 各 warp は 64x32 の C を担当 = 4x2 個の 16x16 WMMA フラグメント。
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 32;
+constexpr int WARPS_M = 2;
+constexpr int WARPS_N = 4;
+constexpr int THREADS = 32 * WARPS_M * WARPS_N;   // 256
+constexpr int WM = BM / WARPS_M;                  // 64
+constexpr int WN = BN / WARPS_N;                  // 32
+constexpr int FM = WM / 16;                       // 4
+constexpr int FN = WN / 16;                       // 2
+constexpr int FK = BK / 16;                       // 2
+// 4 ステージにして DRAM 遅延の隠蔽を厚くする。
+// 1 stage = (BK*BM + BK*BN)*sizeof(half) = (32*128 + 32*128)*2 = 16KB
+// 4 stages * 16KB = 64KB/block。 H100 の per-SM shared (228KB) には 2 ブロック載せても余裕。
+constexpr int STAGES = 4;
+// shared memory のバンク競合を避けるためのパディング (8 halfs = 16 bytes)
+constexpr int PAD = 8;
+constexpr int LDA = BM + PAD;
+constexpr int LDB = BN + PAD;
+
 __device__ __forceinline__ void cp_async_16(void *dst, const void *src) {
   unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(dst));
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(smem_addr), "l"(src));
+  // cg (cache global only): L1 を経由せず L2 から直接 shared に流すので
+  // streaming な GEMM 用途では一般的に ca より高速。
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+               :: "r"(smem_addr), "l"(src));
 }
 
 __device__ __forceinline__ void cp_async_commit_group() {
   asm volatile("cp.async.commit_group;");
 }
 
-__device__ __forceinline__ void cp_async_wait_group_0() {
-  asm volatile("cp.async.wait_group 0;");
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 }
 
 __device__ __forceinline__ void stage_load_cp_async(
-    int thread_id,
+    int tid,
     int tile_k,
     int stage,
     int dim_m,
@@ -32,77 +60,151 @@ __device__ __forceinline__ void stage_load_cp_async(
     int offset_b_n,
     const half *__restrict__ d_a,
     const half *__restrict__ d_b,
-    half block_a[][16][64],
-    half block_b[][16][64]) {
-  // 変更点: 1回のtile読み込みを64スレッドで分担し、A/Bのcp.asyncを同時に発行する
-#pragma unroll
-  for (int chunk = thread_id; chunk < 128; chunk += 64) {
-    int row = chunk >> 3;
-    int col = (chunk & 7) << 3;
-    cp_async_16(&block_a[stage][row][col], &d_a[(tile_k + row) * dim_m + offset_a_m + col]);
-    cp_async_16(&block_b[stage][row][col], &d_b[(tile_k + row) * dim_n + offset_b_n + col]);
+    half block_a[][BK][LDA],
+    half block_b[][BK][LDB]) {
+  // A: M x K 列優先 (k 番目の列が連続) なので、shared[ki][mi] = d_a[(tile_k+ki)*dim_m + offset_a_m + mi]
+  // 1 thread = 16 bytes (8 halfs) を 1 命令でロード。
+  // BK*BM/8 = 32*128/8 = 512 chunks / 256 threads = 2 chunks per thread。
+  constexpr int A_CHUNKS = (BK * BM) / 8;
+  constexpr int A_COLS = BM / 8;            // 1 行あたりの chunk 数
+  #pragma unroll
+  for (int idx = tid; idx < A_CHUNKS; idx += THREADS) {
+    int row = idx / A_COLS;
+    int col = (idx % A_COLS) * 8;
+    cp_async_16(&block_a[stage][row][col],
+                &d_a[(tile_k + row) * dim_m + offset_a_m + col]);
+  }
+  // B (転置済み): K x N 行優先 (n 番目の行が連続)
+  constexpr int B_CHUNKS = (BK * BN) / 8;
+  constexpr int B_COLS = BN / 8;
+  #pragma unroll
+  for (int idx = tid; idx < B_CHUNKS; idx += THREADS) {
+    int row = idx / B_COLS;
+    int col = (idx % B_COLS) * 8;
+    cp_async_16(&block_b[stage][row][col],
+                &d_b[(tile_k + row) * dim_n + offset_b_n + col]);
   }
   cp_async_commit_group();
 }
 
-__global__ void kernel(int dim_m, int dim_n, int dim_k,
-           const half *__restrict__ d_a,
-           const half *__restrict__ d_b,
-           float *__restrict__ d_c) {
-  int offset_a_m = 64 * blockIdx.x;
-  int offset_b_n = 64 * blockIdx.y;
-  int warp_id = threadIdx.x / 32;
+__global__ __launch_bounds__(THREADS, 1) void kernel(
+    int dim_m, int dim_n, int dim_k,
+    const half *__restrict__ d_a,
+    const half *__restrict__ d_b,
+    float *__restrict__ d_c) {
+  int offset_a_m = BM * blockIdx.x;
+  int offset_b_n = BN * blockIdx.y;
+  int tid = threadIdx.x;
+  int warp_id = tid >> 5;
+  int warp_row = warp_id / WARPS_N;   // 0..WARPS_M-1
+  int warp_col = warp_id % WARPS_N;   // 0..WARPS_N-1
 
-  __shared__ __align__(16) half block_a[2][16][64];
-  __shared__ __align__(16) half block_b[2][16][64];
+  __shared__ __align__(16) half block_a[STAGES][BK][LDA];
+  __shared__ __align__(16) half block_b[STAGES][BK][LDB];
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4]; //16*16*16の箱のイメージ
-
-  //initialize output to zero
-  for (int r = 0; r < 2; r++)
-    for (int c = 0; c < 4; c++)
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[FM][FN];
+  #pragma unroll
+  for (int r = 0; r < FM; r++)
+    #pragma unroll
+    for (int c = 0; c < FN; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
-  int num_tiles = dim_k / 16;
+  int num_tiles = dim_k / BK;
 
-  stage_load_cp_async(threadIdx.x, 0, 0, dim_m, dim_n, offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
-  cp_async_wait_group_0();
-  __syncthreads();
-
-  for (int tile = 0; tile < num_tiles; ++tile) {
-    int cur = tile & 1;
-    int nxt = cur ^ 1;
-
-    if (tile + 1 < num_tiles) {
-      stage_load_cp_async(threadIdx.x, (tile + 1) * 16, nxt, dim_m, dim_n, offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
-    }
-
-    // 変更点: Bフラグメントはrに依存しないため、先に4個まとめてロードして再利用
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag[4];
-    for (int c = 0; c < 4; c++) {
-      wmma::load_matrix_sync(b_frag[c], &block_b[cur][0][c * 16], 64);
-    }
-    for (int r = 0; r < 2; r++) {
-      int row_tile = warp_id * 2 + r;
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-      wmma::load_matrix_sync(a_frag, &block_a[cur][0][row_tile * 16], 64);
-      for (int c = 0; c < 4; c++) {
-        wmma::mma_sync(acc[r][c], a_frag, b_frag[c], acc[r][c]);
-      }
-    }
-
-    if (tile + 1 < num_tiles) {
-      cp_async_wait_group_0();
-      __syncthreads();
+  // ---- prologue: STAGES-1 個のステージを先行投入 ----
+  int prefetch = 0;
+  #pragma unroll
+  for (int s = 0; s < STAGES - 1; s++) {
+    if (prefetch < num_tiles) {
+      stage_load_cp_async(tid, prefetch * BK, s, dim_m, dim_n,
+                          offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
+      prefetch++;
+    } else {
+      cp_async_commit_group();
     }
   }
 
-  for (int r = 0; r < 2; r++) {
-    for (int c = 0; c < 4; c++) {
-      int c_m = offset_a_m + (warp_id * 2 + r) * 16;
-      int c_n = offset_b_n + c * 16;
+  for (int tile = 0; tile < num_tiles; ++tile) {
+    int cur = tile % STAGES;
+
+    // 次のステージを発行 (パイプラインを満たし続ける)
+    int nxt = prefetch % STAGES;
+    if (prefetch < num_tiles) {
+      stage_load_cp_async(tid, prefetch * BK, nxt, dim_m, dim_n,
+                          offset_a_m, offset_b_n, d_a, d_b, block_a, block_b);
+      prefetch++;
+    } else {
+      cp_async_commit_group();
+    }
+
+    // 現在のステージが書き込み終わるのを待つ。
+    // STAGES-1 個のグループが in-flight として残っている状態にする。
+    cp_async_wait_group<STAGES - 1>();
+    __syncthreads();
+
+    int base_a_col = warp_row * WM;   // この warp の M オフセット
+    int base_b_col = warp_col * WN;   // この warp の N オフセット
+
+    // ---- inner-K register double-buffer ----
+    // FK=2 でも、フラグメント LDS と mma_sync をオーバーラップさせるために
+    // ピンポンバッファで kk と kk+1 を重ねて発行する。
+    // テンソルコア発行ストールが短縮され、 Compute Throughput が上がる狙い。
+    using FragA = wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major>;
+    using FragB = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>;
+    FragA a_frag[2][FM];
+    FragB b_frag[2][FN];
+
+    // kk = 0 のフラグメントを先読み
+    #pragma unroll
+    for (int c = 0; c < FN; c++) {
+      wmma::load_matrix_sync(b_frag[0][c],
+          &block_b[cur][0 * 16][base_b_col + c * 16], LDB);
+    }
+    #pragma unroll
+    for (int r = 0; r < FM; r++) {
+      wmma::load_matrix_sync(a_frag[0][r],
+          &block_a[cur][0 * 16][base_a_col + r * 16], LDA);
+    }
+
+    #pragma unroll
+    for (int kk = 0; kk < FK; kk++) {
+      int cur_buf = kk & 1;
+      int nxt_buf = cur_buf ^ 1;
+      // 次の kk のフラグメントをプリロード（最後のイテレーションでは省略）
+      if (kk + 1 < FK) {
+        int kn = (kk + 1) * 16;
+        #pragma unroll
+        for (int c = 0; c < FN; c++) {
+          wmma::load_matrix_sync(b_frag[nxt_buf][c],
+              &block_b[cur][kn][base_b_col + c * 16], LDB);
+        }
+        #pragma unroll
+        for (int r = 0; r < FM; r++) {
+          wmma::load_matrix_sync(a_frag[nxt_buf][r],
+              &block_a[cur][kn][base_a_col + r * 16], LDA);
+        }
+      }
+      // 現バッファで mma 発行（プリロード LDS と発行をオーバーラップ）
+      #pragma unroll
+      for (int r = 0; r < FM; r++) {
+        #pragma unroll
+        for (int c = 0; c < FN; c++) {
+          wmma::mma_sync(acc[r][c], a_frag[cur_buf][r], b_frag[cur_buf][c], acc[r][c]);
+        }
+      }
+    }
+  }
+
+  // ---- C への書き戻し ----
+  #pragma unroll
+  for (int r = 0; r < FM; r++) {
+    #pragma unroll
+    for (int c = 0; c < FN; c++) {
+      int c_m = offset_a_m + warp_row * WM + r * 16;
+      int c_n = offset_b_n + warp_col * WN + c * 16;
       if (c_n < dim_n && c_m < dim_m)
-        wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
+        wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m],
+                                acc[r][c], dim_m, wmma::mem_col_major);
     }
   }
 }
@@ -181,9 +283,9 @@ int main(int argc, const char **argv) {
   cudaEventElapsedTime(&cublas_ms, start_event, stop_event);
   double tcublas = double(cublas_ms) / 1.0e3 / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
-  int tile = 64;
-  dim3 block = dim3(tile);
-  dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
+  // 1 ブロックで 128x128 タイルを処理。 256 threads = 8 warps。
+  dim3 block = dim3(THREADS);
+  dim3 grid = dim3((m + BM - 1) / BM, (n + BN - 1) / BN);
   float kernel_ms = 0.0f;
   cudaEventRecord(start_event);
   for (int i = 0; i < Nt+2; i++) {
