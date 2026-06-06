@@ -29,4 +29,4 @@
 13_tensorcore_noarch: 13_tensorcore.cu
 	nvcc 13_tensorcore.cu -Xcompiler "-O3 -fopenmp" -lcublas -o 13_tensorcore_noarch
 13_tensorcore_sm90: 13_tensorcore.cu
-	nvcc 13_tensorcore.cu -arch=sm_90 -O3 -Xcompiler "-O3 -fopenmp" -lcublas -o 13_tensorcore_sm90
+	nvcc 13_tensorcore.cu -arch=sm_90 -O3 -DUSE_INLINE_MMA_KERNEL -Xcompiler "-O3 -fopenmp" -lcublas -o 13_tensorcore_sm90

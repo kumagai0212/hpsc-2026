@@ -43,6 +43,14 @@ static inline void check_cuda(cudaError_t status, const char* where) {
 #define WRK_B_LD (N_TILE + 8)
 #define WMMA_B_LD (K_TILE + 8)
 
+#define WMMA_M_TILE 256
+#define WMMA_N_TILE 128
+#define WMMA_K_TILE 32
+#define WMMA_WARPS  16
+#define WMMA_THREADS (WMMA_WARPS * 32)
+#define WMMA_A_LD (WMMA_M_TILE + 8)
+#define WMMA_B2_LD (WMMA_K_TILE + 8)
+
 #define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
 #define B_STEPS  ((N_TILE * K_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
 
@@ -360,6 +368,81 @@ __global__ void tensorcore_sgemm_kernel(int M, int N, int K,
 #endif
 }
 
+__global__ void wmma_sgemm_256x128_kernel(int M, int N, int K,
+                                          const half* __restrict__ A,
+                                          const half* __restrict__ B,
+                                          float* __restrict__ C) {
+    const int bm = blockIdx.x * WMMA_M_TILE;
+    const int bn = blockIdx.y * WMMA_N_TILE;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int warp_m = warp_id >> 1;
+    const int warp_n = warp_id & 1;
+
+    __shared__ half block_a[WMMA_K_TILE][WMMA_A_LD];
+    __shared__ half block_b[WMMA_N_TILE][WMMA_B2_LD];
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
+    #pragma unroll
+    for (int r = 0; r < 2; r++)
+        #pragma unroll
+        for (int c = 0; c < 4; c++)
+            wmma::fill_fragment(acc[r][c], 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += WMMA_K_TILE) {
+        for (int idx = tid; idx < WMMA_K_TILE * WMMA_M_TILE; idx += WMMA_THREADS) {
+            int local_m = idx % WMMA_M_TILE;
+            int local_k = idx / WMMA_M_TILE;
+            block_a[local_k][local_m] =
+                A[(size_t)(k0 + local_k) * M + bm + local_m];
+        }
+
+        for (int idx = tid; idx < WMMA_K_TILE * WMMA_N_TILE; idx += WMMA_THREADS) {
+            int local_k = idx % WMMA_K_TILE;
+            int local_n = idx / WMMA_K_TILE;
+            block_b[local_n][local_k] =
+                B[(size_t)(k0 + local_k) * N + bn + local_n];
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < WMMA_K_TILE; kk += 16) {
+            #pragma unroll
+            for (int r = 0; r < 2; r++) {
+                int a_tile = warp_m * 2 + r;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half,
+                               wmma::col_major> a_frag;
+                wmma::load_matrix_sync(a_frag, &block_a[kk][a_tile * 16],
+                                       WMMA_A_LD);
+
+                #pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    int b_tile = warp_n * 4 + c;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half,
+                                   wmma::col_major> b_frag;
+                    wmma::load_matrix_sync(b_frag, &block_b[b_tile * 16][kk],
+                                           WMMA_B2_LD);
+                    wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int r = 0; r < 2; r++) {
+        int cm = bm + (warp_m * 2 + r) * 16;
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            int cn = bn + (warp_n * 4 + c) * 16;
+            wmma::store_matrix_sync(&C[(size_t)cn * M + cm], acc[r][c],
+                                    M, wmma::mem_col_major);
+        }
+    }
+}
+
 int main(int argc, const char **argv) {
     int m = 10240, k = 4096, n = 8192;
     float alpha = 1.0, beta = 0.0;
@@ -406,6 +489,7 @@ int main(int argc, const char **argv) {
     double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
     double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
+#ifdef USE_INLINE_MMA_KERNEL
     dim3 block(THREADS);
     dim3 grid((m + M_TILE - 1) / M_TILE, (n + N_TILE - 1) / N_TILE);
     size_t smem_bytes =
@@ -433,11 +517,22 @@ int main(int argc, const char **argv) {
                                     cudaFuncAttributePreferredSharedMemoryCarveout,
                                     cudaSharedmemCarveoutMaxShared),
                "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
+#else
+    dim3 block(WMMA_THREADS);
+    dim3 grid((m + WMMA_M_TILE - 1) / WMMA_M_TILE,
+              (n + WMMA_N_TILE - 1) / WMMA_N_TILE);
+#endif
     for (int i = 0; i < Nt + 2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
+#ifdef USE_INLINE_MMA_KERNEL
         tensorcore_sgemm_kernel<<<grid, block, smem_bytes>>>(m, n, k, A16, B16_T, C2);
         check_cuda(cudaGetLastError(), "tensorcore_sgemm_kernel launch");
         check_cuda(cudaDeviceSynchronize(), "tensorcore_sgemm_kernel synchronize");
+#else
+        wmma_sgemm_256x128_kernel<<<grid, block>>>(m, n, k, A16, B16_T, C2);
+        check_cuda(cudaGetLastError(), "wmma_sgemm_256x128_kernel launch");
+        check_cuda(cudaDeviceSynchronize(), "wmma_sgemm_256x128_kernel synchronize");
+#endif
     }
     toc = chrono::steady_clock::now();
     double tours = chrono::duration<double>(toc - tic).count() / Nt;
