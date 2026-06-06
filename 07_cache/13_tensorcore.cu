@@ -286,20 +286,70 @@ __global__ void tensorcore_sgemm_kernel(int M, int N, int K,
     const int bm = blockIdx.x * M_TILE;
     const int bn = blockIdx.y * N_TILE;
     const int tid = threadIdx.x;
-    const int tile_elems = M_TILE * N_TILE;
 
-    for (int idx = tid; idx < tile_elems; idx += blockDim.x) {
-        int local_m = idx % M_TILE;
-        int local_n = idx / M_TILE;
-        int m = bm + local_m;
-        int n = bn + local_n;
-        if (m < M && n < N) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += __half2float(A[(size_t)k * M + m])
-                     * __half2float(B[(size_t)k * N + n]);
-            }
-            C[(size_t)n * M + m] = sum;
+    __shared__ float block_a[8][M_TILE];
+    __shared__ float block_b[8][N_TILE];
+
+    const int thread_m = (tid & 15) * 8;
+    const int thread_n = (tid >> 4) * 8;
+    float acc[8][8];
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            acc[i][j] = 0.0f;
+
+    for (int kk = 0; kk < K; kk += 8) {
+        #pragma unroll
+        for (int x = 0; x < 4; x++) {
+            int a_idx = tid * 4 + x;
+            int a_k = a_idx / M_TILE;
+            int a_m = a_idx - a_k * M_TILE;
+            int gm = bm + a_m;
+            int gk = kk + a_k;
+            block_a[a_k][a_m] =
+                (gm < M && gk < K) ? __half2float(A[(size_t)gk * M + gm]) : 0.0f;
+
+            int b_idx = tid * 4 + x;
+            int b_k = b_idx / N_TILE;
+            int b_n = b_idx - b_k * N_TILE;
+            int gn = bn + b_n;
+            block_b[b_k][b_n] =
+                (gn < N && gk < K) ? __half2float(B[(size_t)gk * N + gn]) : 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k8 = 0; k8 < 8; k8++) {
+            float a_frag[8];
+            float b_frag[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                a_frag[i] = block_a[k8][thread_m + i];
+            #pragma unroll
+            for (int j = 0; j < 8; j++)
+                b_frag[j] = block_b[k8][thread_n + j];
+
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                #pragma unroll
+                for (int j = 0; j < 8; j++)
+                    acc[i][j] += a_frag[i] * b_frag[j];
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int m = bm + thread_m + i;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int n = bn + thread_n + j;
+            if (m < M && n < N)
+                C[(size_t)n * M + m] = acc[i][j];
         }
     }
 #endif
