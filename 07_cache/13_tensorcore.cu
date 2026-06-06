@@ -46,17 +46,25 @@ static inline void check_cuda(cudaError_t status, const char* where) {
 // ---- cp.async helpers ----
 __device__ __forceinline__
 void async_copy_16b(uint32_t smem_int_ptr, const void* gmem_ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
                  :: "r"(smem_int_ptr), "l"(gmem_ptr));
+#endif
 }
 __device__ __forceinline__ void async_copy_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;\n" ::);
+#endif
 }
 __device__ __forceinline__ void async_copy_wait_lt1() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 1;\n" ::);
+#endif
 }
 __device__ __forceinline__ void async_copy_wait_all() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
 }
 
 // ---- ldmatrix helpers ----
@@ -64,11 +72,15 @@ __device__ __forceinline__ void async_copy_wait_all() {
 // Returns 4 .b32 regs per thread (= 8 halfs = 4 half2).
 __device__ __forceinline__
 void load_matrix_trans_x4(uint32_t (&r)[4], uint32_t smem_int_ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
         "{%0, %1, %2, %3}, [%4];\n"
         : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
         : "r"(smem_int_ptr));
+#else
+    r[0] = r[1] = r[2] = r[3] = 0;
+#endif
 }
 
 // ---- mma helpers ----
@@ -81,6 +93,7 @@ void tensor_mma_m16n8k16(float (&d)[4],
                          const uint32_t (&a)[4],
                          const uint32_t (&b)[2],
                          const float (&c)[4]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0, %1, %2, %3}, "
@@ -91,12 +104,19 @@ void tensor_mma_m16n8k16(float (&d)[4],
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
           "r"(b[0]), "r"(b[1]),
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#else
+    d[0] = c[0];
+    d[1] = c[1];
+    d[2] = c[2];
+    d[3] = c[3];
+#endif
 }
 
 __global__ void tensorcore_sgemm_kernel(int M, int N, int K,
                                         const half* __restrict__ A,
                                         const half* __restrict__ B,
                                         float* __restrict__ C) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const int bm = blockIdx.x * M_TILE;
     const int bn = blockIdx.y * N_TILE;
     const int tid = threadIdx.x;
@@ -262,6 +282,27 @@ __global__ void tensorcore_sgemm_kernel(int M, int N, int K,
             C[(size_t)c1 * M + r1] = acc[i][j][3];
         }
     }
+#else
+    const int bm = blockIdx.x * M_TILE;
+    const int bn = blockIdx.y * N_TILE;
+    const int tid = threadIdx.x;
+    const int tile_elems = M_TILE * N_TILE;
+
+    for (int idx = tid; idx < tile_elems; idx += blockDim.x) {
+        int local_m = idx % M_TILE;
+        int local_n = idx / M_TILE;
+        int m = bm + local_m;
+        int n = bn + local_n;
+        if (m < M && n < N) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum += __half2float(A[(size_t)k * M + m])
+                     * __half2float(B[(size_t)k * N + n]);
+            }
+            C[(size_t)n * M + m] = sum;
+        }
+    }
+#endif
 }
 
 int main(int argc, const char **argv) {
