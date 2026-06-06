@@ -4,10 +4,12 @@
 #include <stdint.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <chrono>
 #include <stdio.h>
 #include <stdlib.h>
 using namespace std;
+using namespace nvcuda;
 
 static inline void check_cuda(cudaError_t status, const char* where) {
     if (status != cudaSuccess) {
@@ -39,6 +41,7 @@ static inline void check_cuda(cudaError_t status, const char* where) {
 // (proper XOR swizzle comes in 18).
 #define WRK_A_LD (M_TILE + 8)
 #define WRK_B_LD (N_TILE + 8)
+#define WMMA_B_LD (K_TILE + 8)
 
 #define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
 #define B_STEPS  ((N_TILE * K_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
@@ -286,70 +289,72 @@ __global__ void tensorcore_sgemm_kernel(int M, int N, int K,
     const int bm = blockIdx.x * M_TILE;
     const int bn = blockIdx.y * N_TILE;
     const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int warp_m = warp_id >> 1;
+    const int warp_n = warp_id & 1;
 
-    __shared__ float block_a[8][M_TILE];
-    __shared__ float block_b[8][N_TILE];
+    __shared__ half block_a[K_TILE][WRK_A_LD];
+    __shared__ half block_b[N_TILE][WMMA_B_LD];
 
-    const int thread_m = (tid & 15) * 8;
-    const int thread_n = (tid >> 4) * 8;
-    float acc[8][8];
-
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
     #pragma unroll
-    for (int i = 0; i < 8; i++)
+    for (int r = 0; r < 2; r++)
         #pragma unroll
-        for (int j = 0; j < 8; j++)
-            acc[i][j] = 0.0f;
+        for (int c = 0; c < 4; c++)
+            wmma::fill_fragment(acc[r][c], 0.0f);
 
-    for (int kk = 0; kk < K; kk += 8) {
-        #pragma unroll
-        for (int x = 0; x < 4; x++) {
-            int a_idx = tid * 4 + x;
-            int a_k = a_idx / M_TILE;
-            int a_m = a_idx - a_k * M_TILE;
-            int gm = bm + a_m;
-            int gk = kk + a_k;
-            block_a[a_k][a_m] =
-                (gm < M && gk < K) ? __half2float(A[(size_t)gk * M + gm]) : 0.0f;
+    for (int k0 = 0; k0 < K; k0 += K_TILE) {
+        for (int idx = tid; idx < K_TILE * M_TILE; idx += THREADS) {
+            int local_m = idx % M_TILE;
+            int local_k = idx / M_TILE;
+            int gm = bm + local_m;
+            int gk = k0 + local_k;
+            block_a[local_k][local_m] =
+                (gm < M && gk < K) ? A[(size_t)gk * M + gm] : __float2half(0.0f);
+        }
 
-            int b_idx = tid * 4 + x;
-            int b_k = b_idx / N_TILE;
-            int b_n = b_idx - b_k * N_TILE;
-            int gn = bn + b_n;
-            block_b[b_k][b_n] =
-                (gn < N && gk < K) ? __half2float(B[(size_t)gk * N + gn]) : 0.0f;
+        for (int idx = tid; idx < K_TILE * N_TILE; idx += THREADS) {
+            int local_k = idx % K_TILE;
+            int local_n = idx / K_TILE;
+            int gn = bn + local_n;
+            int gk = k0 + local_k;
+            block_b[local_n][local_k] =
+                (gn < N && gk < K) ? B[(size_t)gk * N + gn] : __float2half(0.0f);
         }
 
         __syncthreads();
 
         #pragma unroll
-        for (int k8 = 0; k8 < 8; k8++) {
-            float a_frag[8];
-            float b_frag[8];
+        for (int kk = 0; kk < K_TILE; kk += 16) {
             #pragma unroll
-            for (int i = 0; i < 8; i++)
-                a_frag[i] = block_a[k8][thread_m + i];
-            #pragma unroll
-            for (int j = 0; j < 8; j++)
-                b_frag[j] = block_b[k8][thread_n + j];
+            for (int r = 0; r < 2; r++) {
+                int a_tile = warp_m * 2 + r;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+                wmma::load_matrix_sync(a_frag, &block_a[kk][a_tile * 16], WRK_A_LD);
 
-            #pragma unroll
-            for (int i = 0; i < 8; i++)
                 #pragma unroll
-                for (int j = 0; j < 8; j++)
-                    acc[i][j] += a_frag[i] * b_frag[j];
+                for (int c = 0; c < 4; c++) {
+                    int b_tile = warp_n * 4 + c;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+                    wmma::load_matrix_sync(b_frag, &block_b[b_tile * 16][kk], WMMA_B_LD);
+                    wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
+                }
+            }
         }
 
         __syncthreads();
     }
 
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        int m = bm + thread_m + i;
+    for (int r = 0; r < 2; r++) {
+        int cm = bm + (warp_m * 2 + r) * 16;
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            int n = bn + thread_n + j;
-            if (m < M && n < N)
-                C[(size_t)n * M + m] = acc[i][j];
+        for (int c = 0; c < 4; c++) {
+            int cn = bn + (warp_n * 4 + c) * 16;
+            if (cm + 15 < M && cn + 15 < N) {
+                wmma::store_matrix_sync(&C[(size_t)cn * M + cm], acc[r][c],
+                                        M, wmma::mem_col_major);
+            }
         }
     }
 #endif
