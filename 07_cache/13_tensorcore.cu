@@ -22,7 +22,7 @@ static inline void check_cuda(cudaError_t status, const char* where) {
 #define STAGES   2
 
 #define WARPS_M  2
-#define WARPS_N  8
+#define WARPS_N  4
 #define WARPS    (WARPS_M * WARPS_N)
 #define THREADS  (WARPS * 32)
 
@@ -40,22 +40,22 @@ static inline void check_cuda(cudaError_t status, const char* where) {
 #define WRK_A_LD (M_TILE + 8)
 #define WRK_B_LD (N_TILE + 8)
 
-#define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 8))   // 1 half8 chunk/thread
+#define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
 #define B_STEPS  ((N_TILE * K_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
 
 // ---- cp.async helpers ----
 __device__ __forceinline__
-void cp_async16(uint32_t smem_int_ptr, const void* gmem_ptr) {
+void async_copy_16b(uint32_t smem_int_ptr, const void* gmem_ptr) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
                  :: "r"(smem_int_ptr), "l"(gmem_ptr));
 }
-__device__ __forceinline__ void cp_async_commit() {
+__device__ __forceinline__ void async_copy_commit() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
-__device__ __forceinline__ void cp_async_wait_lt1() {
+__device__ __forceinline__ void async_copy_wait_lt1() {
     asm volatile("cp.async.wait_group 1;\n" ::);
 }
-__device__ __forceinline__ void cp_async_wait_all() {
+__device__ __forceinline__ void async_copy_wait_all() {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
 
@@ -63,7 +63,7 @@ __device__ __forceinline__ void cp_async_wait_all() {
 // Loads a 16x16 (4 x 8x8 sub-tiles) of fp16 from shared memory with transpose.
 // Returns 4 .b32 regs per thread (= 8 halfs = 4 half2).
 __device__ __forceinline__
-void ldmatrix_trans_x4(uint32_t (&r)[4], uint32_t smem_int_ptr) {
+void load_matrix_trans_x4(uint32_t (&r)[4], uint32_t smem_int_ptr) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
         "{%0, %1, %2, %3}, [%4];\n"
@@ -77,10 +77,10 @@ void ldmatrix_trans_x4(uint32_t (&r)[4], uint32_t smem_int_ptr) {
 //   B: 2 x .b32  (= 4 fp16)
 //   C/D: 4 x .f32
 __device__ __forceinline__
-void mma_m16n8k16(float (&d)[4],
-                  const uint32_t (&a)[4],
-                  const uint32_t (&b)[2],
-                  const float (&c)[4]) {
+void tensor_mma_m16n8k16(float (&d)[4],
+                         const uint32_t (&a)[4],
+                         const uint32_t (&b)[2],
+                         const float (&c)[4]) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0, %1, %2, %3}, "
@@ -93,18 +93,17 @@ void mma_m16n8k16(float (&d)[4],
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 
-__global__ __launch_bounds__(THREADS, 1)
-void sgemm_v17(int M, int N, int K,
-               const half* __restrict__ A,
-               const half* __restrict__ B,
-               float* __restrict__ C) {
+__global__ void tensorcore_sgemm_kernel(int M, int N, int K,
+                                        const half* __restrict__ A,
+                                        const half* __restrict__ B,
+                                        float* __restrict__ C) {
     const int bm = blockIdx.x * M_TILE;
     const int bn = blockIdx.y * N_TILE;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
     const int wm = warp_id / WARPS_N;        // 0..1
-    const int wn = warp_id % WARPS_N;        // 0..7
+    const int wn = warp_id % WARPS_N;        // 0..3
 
     extern __shared__ unsigned char smem[];
     half*  wrkA = reinterpret_cast<half*>(smem);
@@ -121,7 +120,7 @@ void sgemm_v17(int M, int N, int K,
             const half* gptr = &A[(kbase + k_off) * M + bm + m_off];
             uint32_t sptr = __cvta_generic_to_shared(
                 &wrkA[wrkA_base + k_off * WRK_A_LD + m_off]);
-            cp_async16(sptr, gptr);
+            async_copy_16b(sptr, gptr);
         }
         const int wrkB_base = stage * (K_TILE * WRK_B_LD);
         #pragma unroll
@@ -133,7 +132,7 @@ void sgemm_v17(int M, int N, int K,
             const half* gptr = &B[(kbase + k_off) * N + bn + n_off];
             uint32_t sptr = __cvta_generic_to_shared(
                 &wrkB[wrkB_base + k_off * WRK_B_LD + n_off]);
-            cp_async16(sptr, gptr);
+            async_copy_16b(sptr, gptr);
         }
     };
 
@@ -149,7 +148,7 @@ void sgemm_v17(int M, int N, int K,
 
     // ---- Prologue: load tile 0 ----
     issue_load(0, 0);
-    cp_async_commit();
+    async_copy_commit();
 
     const int num_k_iters = K / K_TILE;
     for (int it = 0; it < num_k_iters; it++) {
@@ -158,10 +157,10 @@ void sgemm_v17(int M, int N, int K,
         if (it + 1 < num_k_iters) {
             int nxt = (it + 1) % STAGES;
             issue_load(nxt, (it + 1) * K_TILE);
-            cp_async_commit();
-            cp_async_wait_lt1();
+            async_copy_commit();
+            async_copy_wait_lt1();
         } else {
-            cp_async_wait_all();
+            async_copy_wait_all();
         }
 
         __syncthreads();
@@ -200,7 +199,7 @@ void sgemm_v17(int M, int N, int K,
                 int col = m_base + lane_col_a;
                 uint32_t sptr = __cvta_generic_to_shared(
                     &wrkA[wrkA_base + row * WRK_A_LD + col]);
-                ldmatrix_trans_x4(a_regs[i], sptr);
+                load_matrix_trans_x4(a_regs[i], sptr);
             }
 
             // Load B: 2 ldmatrix.trans.x4 covering 32 N (= 4 N tiles of 8).
@@ -213,7 +212,7 @@ void sgemm_v17(int M, int N, int K,
                 int col = n_base + lane_col_b;
                 uint32_t sptr = __cvta_generic_to_shared(
                     &wrkB[wrkB_base + row * WRK_B_LD + col]);
-                ldmatrix_trans_x4(b_x4[g], sptr);
+                load_matrix_trans_x4(b_x4[g], sptr);
             }
             // Re-pack into per-N-tile registers (each tile uses 2 .b32).
             // ldmatrix.x4 result for matrix_b 16x16 stored as col-major view:
@@ -232,7 +231,7 @@ void sgemm_v17(int M, int N, int K,
             for (int i = 0; i < WTM; i++) {
                 #pragma unroll
                 for (int j = 0; j < WTN; j++) {
-                    mma_m16n8k16(acc[i][j], a_regs[i], b_regs[j], acc[i][j]);
+                    tensor_mma_m16n8k16(acc[i][j], a_regs[i], b_regs[j], acc[i][j]);
                 }
             }
         }
@@ -325,29 +324,29 @@ int main(int argc, const char **argv) {
                "cudaDeviceGetAttribute(MaxSharedMemoryPerBlockOptin)");
     if (smem_bytes > (size_t)max_smem_optin) {
         fprintf(stderr,
-                "sgemm_v17 needs %zu bytes dynamic shared memory, "
+                "tensorcore_sgemm_kernel needs %zu bytes dynamic shared memory, "
                 "but this device allows %d bytes per block\n",
                 smem_bytes, max_smem_optin);
         exit(1);
     }
-    check_cuda(cudaFuncSetAttribute(sgemm_v17,
+    check_cuda(cudaFuncSetAttribute(tensorcore_sgemm_kernel,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)smem_bytes),
                "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
-    check_cuda(cudaFuncSetAttribute(sgemm_v17,
+    check_cuda(cudaFuncSetAttribute(tensorcore_sgemm_kernel,
                                     cudaFuncAttributePreferredSharedMemoryCarveout,
                                     cudaSharedmemCarveoutMaxShared),
                "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
     for (int i = 0; i < Nt + 2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        sgemm_v17<<<grid, block, smem_bytes>>>(m, n, k, A16, B16_T, C2);
-        check_cuda(cudaGetLastError(), "sgemm_v17 launch");
-        check_cuda(cudaDeviceSynchronize(), "sgemm_v17 synchronize");
+        tensorcore_sgemm_kernel<<<grid, block, smem_bytes>>>(m, n, k, A16, B16_T, C2);
+        check_cuda(cudaGetLastError(), "tensorcore_sgemm_kernel launch");
+        check_cuda(cudaDeviceSynchronize(), "tensorcore_sgemm_kernel synchronize");
     }
     toc = chrono::steady_clock::now();
     double tours = chrono::duration<double>(toc - tic).count() / Nt;
     double ours_flops = double(num_flops) / tours / 1.0e9;
-    printf("CUBLAS: %.2f Gflops, CUTLASS: %.2f Gflops\n", cublas_flops, ours_flops);
+    printf("CUBLAS: %.2f Gflops, KERNEL: %.2f Gflops\n", cublas_flops, ours_flops);
 
     double err = 0;
     for (int i = 0; i < n; i++)
