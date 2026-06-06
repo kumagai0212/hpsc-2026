@@ -40,8 +40,8 @@ static inline void check_cuda(cudaError_t status, const char* where) {
 #define WRK_A_LD (M_TILE + 8)
 #define WRK_B_LD (N_TILE + 8)
 
-#define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 4))   // 4
-#define B_STEPS  ((N_TILE * K_TILE) / (THREADS * 4))   // 4
+#define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
+#define B_STEPS  ((N_TILE * K_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
 
 // ---- cp.async helpers ----
 __device__ __forceinline__
@@ -94,8 +94,8 @@ void mma_m16n8k16(float (&d)[4],
 }
 
 __global__ void sgemm_v17(int M, int N, int K,
-                          const float* __restrict__ A,
-                          const float* __restrict__ B,
+                          const half* __restrict__ A,
+                          const half* __restrict__ B,
                           float* __restrict__ C) {
     const int bm = blockIdx.x * M_TILE;
     const int bn = blockIdx.y * N_TILE;
@@ -106,69 +106,33 @@ __global__ void sgemm_v17(int M, int N, int K,
     const int wn = warp_id % WARPS_N;        // 0..3
 
     extern __shared__ unsigned char smem[];
-    float* stgA = reinterpret_cast<float*>(smem);
-    float* stgB = stgA + STAGES * K_TILE * M_TILE;
-    half*  wrkA = reinterpret_cast<half*>(stgB + STAGES * N_TILE * K_TILE);
+    half*  wrkA = reinterpret_cast<half*>(smem);
     half*  wrkB = wrkA + STAGES * K_TILE * WRK_A_LD;
 
     auto issue_load = [&](int stage, int kbase) {
-        const int stgA_base = stage * (K_TILE * M_TILE);
-        #pragma unroll
-        for (int s = 0; s < A_STEPS; s++) {
-            int idx4   = s * THREADS + tid;
-            int m_off4 = idx4 & ((M_TILE / 4) - 1);
-            int k_off  = idx4 / (M_TILE / 4);
-            int m_off  = m_off4 * 4;
-            const float* gptr = &A[(kbase + k_off) * M + bm + m_off];
-            uint32_t sptr = __cvta_generic_to_shared(
-                &stgA[stgA_base + k_off * M_TILE + m_off]);
-            cp_async16(sptr, gptr);
-        }
-        const int stgB_base = stage * (N_TILE * K_TILE);
-        #pragma unroll
-        for (int s = 0; s < B_STEPS; s++) {
-            int idx4   = s * THREADS + tid;
-            int k_off4 = idx4 & ((K_TILE / 4) - 1);
-            int n_off  = idx4 / (K_TILE / 4);
-            int k_off  = k_off4 * 4;
-            const float* gptr = &B[(bn + n_off) * K + kbase + k_off];
-            uint32_t sptr = __cvta_generic_to_shared(
-                &stgB[stgB_base + n_off * K_TILE + k_off]);
-            cp_async16(sptr, gptr);
-        }
-    };
-
-    auto convert_stage = [&](int stage) {
-        const int stgA_base = stage * (K_TILE * M_TILE);
         const int wrkA_base = stage * (K_TILE * WRK_A_LD);
         #pragma unroll
         for (int s = 0; s < A_STEPS; s++) {
-            int idx4   = s * THREADS + tid;
-            int m_off4 = idx4 & ((M_TILE / 4) - 1);
-            int k_off  = idx4 / (M_TILE / 4);
-            int m_off  = m_off4 * 4;
-            float4 v = *reinterpret_cast<float4*>(
-                &stgA[stgA_base + k_off * M_TILE + m_off]);
-            half2 h01 = __floats2half2_rn(v.x, v.y);
-            half2 h23 = __floats2half2_rn(v.z, v.w);
-            half* dst = &wrkA[wrkA_base + k_off * WRK_A_LD + m_off];
-            *reinterpret_cast<half2*>(dst + 0) = h01;
-            *reinterpret_cast<half2*>(dst + 2) = h23;
+            int idx8   = s * THREADS + tid;
+            int m_off8 = idx8 & ((M_TILE / 8) - 1);
+            int k_off  = idx8 / (M_TILE / 8);
+            int m_off  = m_off8 * 8;
+            const half* gptr = &A[(kbase + k_off) * M + bm + m_off];
+            uint32_t sptr = __cvta_generic_to_shared(
+                &wrkA[wrkA_base + k_off * WRK_A_LD + m_off]);
+            cp_async16(sptr, gptr);
         }
-        const int stgB_base = stage * (N_TILE * K_TILE);
         const int wrkB_base = stage * (K_TILE * WRK_B_LD);
         #pragma unroll
         for (int s = 0; s < B_STEPS; s++) {
-            int idx4   = s * THREADS + tid;
-            int k_off4 = idx4 & ((K_TILE / 4) - 1);
-            int n_off  = idx4 / (K_TILE / 4);
-            int k_off  = k_off4 * 4;
-            float4 v = *reinterpret_cast<float4*>(
-                &stgB[stgB_base + n_off * K_TILE + k_off]);
-            wrkB[wrkB_base + (k_off + 0) * WRK_B_LD + n_off] = __float2half(v.x);
-            wrkB[wrkB_base + (k_off + 1) * WRK_B_LD + n_off] = __float2half(v.y);
-            wrkB[wrkB_base + (k_off + 2) * WRK_B_LD + n_off] = __float2half(v.z);
-            wrkB[wrkB_base + (k_off + 3) * WRK_B_LD + n_off] = __float2half(v.w);
+            int idx8   = s * THREADS + tid;
+            int n_off8 = idx8 & ((N_TILE / 8) - 1);
+            int k_off  = idx8 / (N_TILE / 8);
+            int n_off  = n_off8 * 8;
+            const half* gptr = &B[(kbase + k_off) * N + bn + n_off];
+            uint32_t sptr = __cvta_generic_to_shared(
+                &wrkB[wrkB_base + k_off * WRK_B_LD + n_off]);
+            cp_async16(sptr, gptr);
         }
     };
 
@@ -182,7 +146,7 @@ __global__ void sgemm_v17(int M, int N, int K,
             for (int x = 0; x < 4; x++)
                 acc[i][j][x] = 0.0f;
 
-    // ---- Prologue: load + convert tile 0 ----
+    // ---- Prologue: load tile 0 ----
     issue_load(0, 0);
     cp_async_commit();
 
@@ -199,7 +163,6 @@ __global__ void sgemm_v17(int M, int N, int K,
             cp_async_wait_all();
         }
 
-        convert_stage(cur);
         __syncthreads();
 
         // ---- MMA over K_TILE in steps of MMA_K=16 ----
@@ -306,16 +269,25 @@ int main(int argc, const char **argv) {
     float alpha = 1.0, beta = 0.0;
     int Nt = 10;
     float *A, *B, *C, *C2;
+    half *A16, *B16_T;
     cudaMallocManaged(&A, m * k * sizeof(float));
     cudaMallocManaged(&B, k * n * sizeof(float));
     cudaMallocManaged(&C,  m * n * sizeof(float));
     cudaMallocManaged(&C2, m * n * sizeof(float));
+    cudaMallocManaged(&A16, m * k * sizeof(half));
+    cudaMallocManaged(&B16_T, k * n * sizeof(half));
     for (int i = 0; i < m; i++)
         for (int j = 0; j < k; j++)
             A[k*i+j] = drand48();
     for (int i = 0; i < k; i++)
         for (int j = 0; j < n; j++)
             B[n*i+j] = drand48();
+    for (int ki = 0; ki < k; ki++)
+        for (int mi = 0; mi < m; mi++)
+            A16[ki * m + mi] = __float2half(A[ki * m + mi]);
+    for (int ki = 0; ki < k; ki++)
+        for (int ni = 0; ni < n; ni++)
+            B16_T[ki * n + ni] = __float2half(B[ni * k + ki]);
     for (int i = 0; i < n; i++)
         for (int j = 0; j < m; j++)
             C[m*i+j] = C2[m*i+j] = 0;
@@ -341,9 +313,7 @@ int main(int argc, const char **argv) {
     dim3 block(THREADS);
     dim3 grid((m + M_TILE - 1) / M_TILE, (n + N_TILE - 1) / N_TILE);
     size_t smem_bytes =
-          (STAGES * K_TILE * M_TILE) * sizeof(float)
-        + (STAGES * N_TILE * K_TILE) * sizeof(float)
-        + (STAGES * K_TILE * WRK_A_LD) * sizeof(half)
+          (STAGES * K_TILE * WRK_A_LD) * sizeof(half)
         + (STAGES * K_TILE * WRK_B_LD) * sizeof(half);
     int dev = 0;
     int max_smem_optin = 0;
@@ -369,7 +339,7 @@ int main(int argc, const char **argv) {
                "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
     for (int i = 0; i < Nt + 2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        sgemm_v17<<<grid, block, smem_bytes>>>(m, n, k, A, B, C2);
+        sgemm_v17<<<grid, block, smem_bytes>>>(m, n, k, A16, B16_T, C2);
         check_cuda(cudaGetLastError(), "sgemm_v17 launch");
         check_cuda(cudaDeviceSynchronize(), "sgemm_v17 synchronize");
     }
@@ -384,6 +354,6 @@ int main(int argc, const char **argv) {
             err += fabs(C[m*i+j] - C2[m*i+j]);
     printf("error: %lf\n", err / n / m);
 
-    cudaFree(A); cudaFree(B); cudaFree(C); cudaFree(C2);
+    cudaFree(A); cudaFree(B); cudaFree(A16); cudaFree(B16_T); cudaFree(C); cudaFree(C2);
     cublasDestroy(handle);
 }
