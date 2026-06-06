@@ -22,7 +22,7 @@ static inline void check_cuda(cudaError_t status, const char* where) {
 #define STAGES   2
 
 #define WARPS_M  2
-#define WARPS_N  4
+#define WARPS_N  8
 #define WARPS    (WARPS_M * WARPS_N)
 #define THREADS  (WARPS * 32)
 
@@ -40,7 +40,7 @@ static inline void check_cuda(cudaError_t status, const char* where) {
 #define WRK_A_LD (M_TILE + 8)
 #define WRK_B_LD (N_TILE + 8)
 
-#define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
+#define A_STEPS  ((K_TILE * M_TILE) / (THREADS * 8))   // 1 half8 chunk/thread
 #define B_STEPS  ((N_TILE * K_TILE) / (THREADS * 8))   // 2 half8 chunks/thread
 
 // ---- cp.async helpers ----
@@ -93,17 +93,18 @@ void mma_m16n8k16(float (&d)[4],
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 
-__global__ void sgemm_v17(int M, int N, int K,
-                          const half* __restrict__ A,
-                          const half* __restrict__ B,
-                          float* __restrict__ C) {
+__global__ __launch_bounds__(THREADS, 1)
+void sgemm_v17(int M, int N, int K,
+               const half* __restrict__ A,
+               const half* __restrict__ B,
+               float* __restrict__ C) {
     const int bm = blockIdx.x * M_TILE;
     const int bn = blockIdx.y * N_TILE;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
     const int wm = warp_id / WARPS_N;        // 0..1
-    const int wn = warp_id % WARPS_N;        // 0..3
+    const int wn = warp_id % WARPS_N;        // 0..7
 
     extern __shared__ unsigned char smem[];
     half*  wrkA = reinterpret_cast<half*>(smem);
