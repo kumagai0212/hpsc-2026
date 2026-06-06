@@ -5,7 +5,16 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <chrono>
+#include <stdio.h>
+#include <stdlib.h>
 using namespace std;
+
+static inline void check_cuda(cudaError_t status, const char* where) {
+    if (status != cudaSuccess) {
+        fprintf(stderr, "%s failed: %s\n", where, cudaGetErrorString(status));
+        exit(1);
+    }
+}
 
 #define M_TILE   128
 #define N_TILE   128
@@ -336,13 +345,33 @@ int main(int argc, const char **argv) {
         + (STAGES * N_TILE * K_TILE) * sizeof(float)
         + (STAGES * K_TILE * WRK_A_LD) * sizeof(half)
         + (STAGES * K_TILE * WRK_B_LD) * sizeof(half);
-    cudaFuncSetAttribute(sgemm_v17,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)smem_bytes);
+    int dev = 0;
+    int max_smem_optin = 0;
+    check_cuda(cudaGetDevice(&dev), "cudaGetDevice");
+    check_cuda(cudaDeviceGetAttribute(&max_smem_optin,
+                                      cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                      dev),
+               "cudaDeviceGetAttribute(MaxSharedMemoryPerBlockOptin)");
+    if (smem_bytes > (size_t)max_smem_optin) {
+        fprintf(stderr,
+                "sgemm_v17 needs %zu bytes dynamic shared memory, "
+                "but this device allows %d bytes per block\n",
+                smem_bytes, max_smem_optin);
+        exit(1);
+    }
+    check_cuda(cudaFuncSetAttribute(sgemm_v17,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int)smem_bytes),
+               "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
+    check_cuda(cudaFuncSetAttribute(sgemm_v17,
+                                    cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared),
+               "cudaFuncSetAttribute(PreferredSharedMemoryCarveout)");
     for (int i = 0; i < Nt + 2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
         sgemm_v17<<<grid, block, smem_bytes>>>(m, n, k, A, B, C2);
-        cudaDeviceSynchronize();
+        check_cuda(cudaGetLastError(), "sgemm_v17 launch");
+        check_cuda(cudaDeviceSynchronize(), "sgemm_v17 synchronize");
     }
     toc = chrono::steady_clock::now();
     double tours = chrono::duration<double>(toc - tic).count() / Nt;
